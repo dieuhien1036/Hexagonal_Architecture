@@ -1,0 +1,11 @@
+lab1\application\WalletApplicationService.class
+lab1\infrastructure\InMemoryWalletRepository.class
+lab1\domain\repository\WalletRepository.class
+lab1\domain\exception\DomainException.class
+lab1\domain\model\Wallet.class
+lab1\infrastructure\InMemoryWalletRepository$WalletRecord.class
+lab1\domain\model\WalletStatus.class
+lab1\legacy\WalletEntity.class
+lab1\Main.class
+lab1\domain\model\Money.class
+lab1\legacy\WalletService.class

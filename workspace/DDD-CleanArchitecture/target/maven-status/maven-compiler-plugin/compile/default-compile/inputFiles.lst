@@ -1,0 +1,10 @@
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\domain\repository\WalletRepository.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\legacy\WalletService.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\legacy\WalletEntity.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\Main.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\domain\model\Money.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\domain\exception\DomainException.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\application\WalletApplicationService.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\domain\model\Wallet.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\domain\model\WalletStatus.java
+D:\Java3\workspace\DDD-CleanArchitecture\src\main\java\lab1\infrastructure\InMemoryWalletRepository.java
