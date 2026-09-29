@@ -1,0 +1,154 @@
+BÀI TẬP: CHỌN MÔ HÌNH NHẤT QUÁN CHO ỨNG DỤNG MẠNG XÃ HỘI
+=======================================================
+
+Tình huống: thiết kế mạng xã hội đơn giản gồm 5 tính năng:
+Đăng ký/Đăng nhập, Cập nhật Profile, Đăng bài (Post), Bình luận (Comment),
+Bộ đếm "Thích" (Like Count).
+
+
+TÓM TẮT
+-------
+Tính năng            | Mô hình nhất quán                          | Công nghệ lưu trữ
+---------------------|--------------------------------------------|-------------------------------------
+Đăng ký / Đăng nhập  | Strong (Linearizable)                      | PostgreSQL (primary + sync standby)
+Cập nhật Profile     | Eventual + Read-your-writes                | PostgreSQL + read replica + Redis cache, ảnh trên S3/CDN
+Đăng bài (Post)      | Eventual + Read-your-writes + Monotonic    | Cassandra (hoặc Postgres khi còn nhỏ) + Kafka fan-out feed
+Bình luận (Comment)  | Causal consistency                         | Cassandra (partition theo post_id, sắp theo thời gian)
+Bộ đếm Like          | Eventual (đếm xấp xỉ, hội tụ dần)          | Cassandra counter / Redis INCR + bảng likes để chống like trùng
+
+
+1) ĐĂNG KÝ / ĐĂNG NHẬP NGƯỜI DÙNG
+---------------------------------
+Mô hình: STRONG CONSISTENCY (linearizable).
+
+Lý do:
+- Username phải duy nhất: hai người đăng ký cùng lúc cùng một username thì chỉ
+  được một người thành công. Việc này cần một ràng buộc UNIQUE được kiểm tra
+  trên một nguồn sự thật duy nhất.
+- Đổi mật khẩu / khóa tài khoản phải có hiệu lực ngay. Nếu đọc từ replica bị
+  trễ, người dùng có thể đăng nhập bằng mật khẩu cũ -> lỗ hổng bảo mật.
+- Ngay sau khi đăng ký, người dùng phải đăng nhập được liền.
+
+Đánh đổi:
+- Chấp nhận latency cao hơn một chút (đọc/ghi từ primary, sync replication).
+- Khi primary gặp sự cố/partition, đăng ký/đăng nhập có thể tạm lỗi
+  (ưu tiên C hơn A). Chấp nhận được vì tần suất thấp so với đọc feed.
+
+Công nghệ:
+- PostgreSQL: bảng users(id, username UNIQUE, password_hash, ...).
+- Mật khẩu lưu dạng hash (bcrypt/argon2), không lưu plain text.
+- 1 primary + standby synchronous_commit = on để không mất tài khoản khi failover.
+- Kiểm tra đăng nhập luôn đọc từ PRIMARY.
+- Sau khi đăng nhập, cấp session/JWT; session có thể lưu Redis (thu hồi token
+  ghi vào primary rồi mới xóa cache).
+
+
+2) CẬP NHẬT THÔNG TIN CÁ NHÂN (PROFILE: TÊN, ẢNH ĐẠI DIỆN)
+----------------------------------------------------------
+Mô hình: EVENTUAL CONSISTENCY + READ-YOUR-WRITES.
+
+Lý do:
+- Người khác thấy tên/ảnh mới trễ vài giây là không sao.
+- Nhưng chính người vừa sửa phải thấy ngay thay đổi của mình, nếu không họ
+  tưởng cập nhật bị lỗi và bấm sửa lại (read-your-writes).
+
+Đánh đổi:
+- Đọc profile rất nhiều (hiện ở mọi bài viết, bình luận) -> đọc từ replica/cache
+  để nhanh và rẻ, chấp nhận người khác thấy dữ liệu cũ trong thời gian ngắn.
+- Phải thêm logic định tuyến: người vừa ghi thì đọc primary trong vài giây.
+
+Công nghệ:
+- PostgreSQL (bảng profiles) + read replica async.
+- Redis cache profile, xóa cache (invalidate) sau khi ghi.
+- Ảnh đại diện lưu trên object storage (S3/MinIO) + CDN; DB chỉ lưu URL.
+  Upload ảnh tạo file tên mới (có version) thay vì ghi đè để tránh CDN trả ảnh cũ.
+- Read-your-writes: sau khi cập nhật, đặt cờ/cookie "last_write_ts" trong ~5s;
+  trong khoảng đó request của chính user đọc từ primary.
+
+
+3) ĐĂNG BÀI VIẾT (POST)
+-----------------------
+Mô hình: EVENTUAL CONSISTENCY + READ-YOUR-WRITES + MONOTONIC READS.
+
+Lý do:
+- Bài mới xuất hiện trên feed của bạn bè trễ vài giây là chấp nhận được.
+- Người đăng phải thấy ngay bài của mình (read-your-writes).
+- Khi refresh feed, bài đã thấy không được "biến mất" rồi xuất hiện lại
+  (monotonic reads) -> gắn user với cùng một replica (sticky session).
+
+Đánh đổi:
+- Ưu tiên khả năng ghi cao và luôn sẵn sàng (A) hơn là mọi người thấy bài cùng lúc.
+- Fan-out feed bất đồng bộ nên có độ trễ, nhưng hệ thống chịu tải tốt khi nhiều
+  người đăng bài.
+
+Công nghệ:
+- Cassandra: bảng posts partition theo user_id, clustering theo created_at DESC;
+  ghi với consistency LOCAL_QUORUM (không mất bài), đọc LOCAL_ONE cho feed người khác.
+  (Hệ thống nhỏ có thể dùng PostgreSQL + replica.)
+- Post ID dạng Snowflake/UUIDv7 để sắp xếp theo thời gian.
+- Kafka: sự kiện post.created -> worker fan-out ghi vào feed (Redis sorted set).
+- Idempotency key khi tạo bài để bấm "Đăng" 2 lần không tạo 2 bài.
+
+
+4) BÌNH LUẬN (COMMENT)
+----------------------
+Mô hình: CAUSAL CONSISTENCY.
+
+Lý do:
+- Bình luận trả lời phải hiển thị SAU bình luận/bài viết mà nó trả lời.
+  Không được để người dùng thấy câu trả lời "Đồng ý!" mà chưa thấy câu hỏi gốc.
+- Các bình luận không liên quan nhau thì không cần thứ tự toàn cục.
+- Người viết bình luận phải thấy ngay bình luận của mình (read-your-writes,
+  là một phần của causal).
+
+Đánh đổi:
+- Mạnh hơn eventual (giữ đúng quan hệ nhân quả) nhưng rẻ hơn strong
+  (không cần đồng bộ toàn cục mọi bình luận) -> vẫn giữ latency thấp, sẵn sàng cao.
+- Cần lưu parent_id / timestamp và xử lý trường hợp comment con đến trước comment cha
+  (tạm ẩn hoặc hiển thị khi cha đã tới).
+
+Công nghệ:
+- Cassandra: bảng comments partition theo post_id, clustering theo comment_id
+  (timeuuid) -> mọi bình luận của 1 bài nằm cùng partition, đọc tuần tự nhanh.
+- Ghi LOCAL_QUORUM + đọc LOCAL_QUORUM (R + W > N) trong cùng datacenter để
+  người dùng thấy bình luận vừa ghi và bình luận cha.
+- Lưu parent_comment_id; client chỉ hiển thị reply khi đã có parent.
+- (Hệ thống nhỏ: PostgreSQL với FK post_id, parent_id cũng đáp ứng được.)
+
+
+5) BỘ ĐẾM "THÍCH" (LIKE COUNT)
+------------------------------
+Mô hình: EVENTUAL CONSISTENCY (bộ đếm xấp xỉ, hội tụ dần).
+Riêng việc "một user chỉ like 1 lần" cần tính duy nhất theo (post_id, user_id).
+
+Lý do:
+- Người xem không cần con số chính xác tức thời: "1.203 lượt thích" hay "1.205"
+  không ảnh hưởng nghiệp vụ.
+- Bài viết viral có thể nhận hàng nghìn like/giây; nếu dùng strong consistency
+  (lock 1 row đếm) sẽ tạo hot-row, nghẽn và tăng latency.
+- Người vừa bấm like thấy nút đổi màu và số +1 ngay trên client (optimistic UI).
+
+Đánh đổi:
+- Hy sinh độ chính xác tức thời để đổi lấy throughput và latency rất tốt.
+- Counter phân tán có thể lệch tạm thời, cần job đối soát định kỳ
+  (đếm lại từ bảng likes) để hội tụ đúng.
+
+Công nghệ:
+- Cassandra:
+  + Bảng likes(post_id, user_id) PRIMARY KEY (post_id, user_id) -> ghi lại
+    cùng 1 cặp là idempotent, không like trùng.
+  + Bảng like_counts dùng kiểu counter (hoặc Redis INCR/DECR cho số hiển thị).
+- Có thể gộp (batch) like qua Kafka rồi cộng dồn mỗi 1-2 giây để giảm ghi.
+- Job đối soát định kỳ đếm lại từ bảng likes và sửa counter nếu lệch.
+- Có thể dùng CRDT (G-Counter/PN-Counter) nếu chạy nhiều datacenter.
+
+
+KẾT LUẬN
+--------
+- Dữ liệu liên quan đến danh tính và bảo mật (đăng ký/đăng nhập) -> STRONG,
+  dùng CSDL quan hệ (PostgreSQL).
+- Nội dung người dùng tạo ra, đọc nhiều (profile, post) -> EVENTUAL kèm các
+  bảo đảm phía phiên (read-your-writes, monotonic reads) để trải nghiệm đúng.
+- Dữ liệu có quan hệ nhân quả (comment trả lời comment) -> CAUSAL.
+- Dữ liệu tổng hợp tần suất cao (like count) -> EVENTUAL, dùng counter phân tán
+  (Cassandra/Redis) + đối soát định kỳ.
