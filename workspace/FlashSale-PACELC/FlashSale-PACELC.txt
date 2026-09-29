@@ -1,0 +1,137 @@
+BÀI TẬP: HỆ THỐNG FLASH SALE - PHÂN TÍCH PACELC
+==============================================
+
+Bối cảnh: 50k user đồng thời; SLO P95 read < 80ms, P95 write < 120ms;
+không oversell; listing được trễ tồn kho tối đa 2s; thanh toán phải chính xác.
+
+
+1) PHÂN LOẠI PACELC CHO TỪNG LUỒNG
+----------------------------------
+- Listing stock : PA/EL
+  + Partition: vẫn trả dữ liệu (có thể cũ) từ cache/replica.
+  + Bình thường: ưu tiên latency, đọc Redis cache (TTL 1s) -> read replica async.
+  + Lý do: đề cho phép trễ 2s, lượng đọc rất lớn, cần P95 < 80ms.
+
+- Add-to-cart   : PA/EL
+  + Partition: vẫn cho thêm vào giỏ (ghi Redis).
+  + Bình thường: ghi nhanh vào Redis, chỉ kiểm tra tồn kho sơ bộ từ cache.
+  + Lý do: giỏ hàng KHÔNG trừ kho, sai lệch sẽ được chặn ở checkout -> không oversell.
+
+- Checkout      : PC/EC
+  + Partition: từ chối ghi (trả 503 "thử lại") nếu primary không đạt quorum.
+  + Bình thường: chấp nhận thêm vài ms cho sync replication, luôn đọc/ghi primary.
+  + Lý do: không oversell + thanh toán chính xác -> consistency quan trọng hơn availability.
+
+
+2) CHỌN DB VÀ TOPOLOGY
+----------------------
+- Listing cache      : Redis Cluster, async replica, TTL 1s.
+- Catalog            : PostgreSQL 1 primary + 2 read replica ASYNC.
+- Cart               : Redis Cluster riêng (AOF), TTL 30 phút.
+- Inventory gate     : Redis + Lua DECRBY atomic, chỉ để chặn sớm request thừa,
+                       KHÔNG phải nguồn sự thật.
+- Inventory + Orders + Payment ledger + Outbox:
+                       PostgreSQL 1 primary + 2 standby SYNC (quorum ANY 1), 3 AZ,
+                       Patroni + etcd để failover.
+- Event bus          : Kafka 3 broker, RF=3.
+
+Vì sao PostgreSQL cho checkout: cần transaction ACID gộp trừ kho + tạo đơn +
+idempotency key + outbox trong 1 commit; UPDATE có điều kiện là atomic ở mức row.
+
+
+3) CẤU HÌNH / KNOBS
+-------------------
+PostgreSQL (Inventory/Orders - PC/EC):
+  synchronous_commit        = on
+  synchronous_standby_names = 'ANY 1 (pg_az2, pg_az3)'
+  lock_timeout              = 50ms
+  statement_timeout         = 100ms
+  Patroni: synchronous_mode = true, synchronous_mode_strict = true,
+           maximum_lag_on_failover = 0
+  Read from PRIMARY cho mọi truy vấn checkout.
+  PgBouncer pool_mode = transaction.
+  Chia tồn kho mỗi SKU thành N bucket để giảm hot-row lock.
+
+  Câu trừ kho chống oversell:
+    UPDATE inventory SET stock = stock - :qty
+     WHERE sku = :sku AND stock >= :qty;   -- 0 row => hết hàng, rollback
+
+PostgreSQL (Catalog - PA/EL):
+  Replication async; hot_standby_feedback = on;
+  Load balancer loại replica có replay_lag > 1s
+  => tổng độ trễ <= 1s lag + 1s TTL cache = 2s.
+  Read from REPLICA (không dồn về primary).
+
+Redis:
+  Cache : TTL 1s + jitter 0-200ms, không AOF, allkeys-lru.
+  Cart  : appendonly yes, appendfsync everysec, min-replicas-to-write 1.
+
+Kafka:
+  acks=all, enable.idempotence=true, min.insync.replicas=2,
+  unclean.leader.election.enable=false, consumer tắt auto commit.
+
+Ứng dụng:
+  Waiting room + rate limit trước checkout.
+  Retry tối đa 2 lần, exponential backoff + jitter, luôn kèm Idempotency-Key.
+  Gọi cổng thanh toán (PSP) bất đồng bộ qua outbox/Kafka.
+
+
+4) SƠ ĐỒ KIẾN TRÚC (MERMAID)
+----------------------------
+flowchart LR
+    U[50k Users] --> LB[API Gateway + rate limit]
+
+    LB -->|GET listing| LS[Listing Service]
+    LS -->|hit| RC[(Redis Cache TTL 1s)]
+    LS -->|miss| CR[(PG Catalog Replicas - async)]
+    CATP[(PG Catalog Primary)] -. async repl .-> CR
+
+    LB -->|POST cart| CS[Cart Service]
+    CS --> RCART[(Redis Cart)]
+    CS -. soft check .-> RC
+
+    LB -->|POST checkout + Idempotency-Key| CO[Checkout Service]
+    CO -->|1. gate| GATE[(Redis Inventory Gate)]
+    CO -->|2. transaction| PGP[(PG Primary: inventory, orders, ledger, outbox)]
+    PGP == sync quorum ANY 1 ==> PGS1[(Sync Standby AZ2)]
+    PGP == sync quorum ANY 1 ==> PGS2[(Sync Standby AZ3)]
+
+    PGP -->|outbox| K[[Kafka]]
+    K --> PAY[Payment Worker] -->|Idempotency-Key| PSP[(Payment Gateway)]
+    PSP -->|webhook| PAY
+    PAY --> PGP
+    K --> UPD[Cache Updater] --> RC
+    REC[Reconciliation Job] --> PSP
+    REC --> PGP
+
+
+5) RỦI RO VÀ CÁCH GIẢM THIỂU
+----------------------------
+- Replication lag (catalog replica > 2s):
+  Theo dõi replay_lag, loại replica lag > 1s; TTL cache 1s; checkout luôn đọc primary.
+
+- Lag/failover của sync standby (mất đơn, oversell sau failover):
+  Sync quorum ANY 1; chỉ promote standby đã đồng bộ (maximum_lag_on_failover = 0).
+
+- Thundering herd / cache stampede (key hết hạn lúc mở sale):
+  TTL có jitter; single-flight (SET NX lock) chỉ 1 request rebuild cache;
+  stale-while-revalidate; pre-warm cache trước giờ mở bán.
+
+- Thundering herd ở checkout (hot row):
+  Waiting room, rate limit, Redis gate chặn sớm, chia bucket tồn kho, lock_timeout ngắn.
+
+- Retry storm:
+  Backoff + jitter, tối đa 2 lần, circuit breaker, retry budget.
+
+- Idempotency (bấm 2 lần, retry tạo đơn/trừ tiền trùng):
+  Bảng idempotency_keys UNIQUE ghi trong cùng transaction; dùng order_id làm
+  idempotency key khi gọi PSP; consumer Kafka dedupe theo event_id.
+
+- Timeout với cổng thanh toán (không rõ đã trừ tiền chưa):
+  Đặt trạng thái UNKNOWN, hỏi lại PSP; webhook + job đối soát định kỳ; ledger chỉ append.
+
+- Đơn giữ kho nhưng không thanh toán:
+  Giữ kho tối đa 10 phút, quá hạn thì hoàn kho (idempotent theo order_id).
+
+- Network partition giữa các AZ:
+  Checkout chọn C (ngừng ghi, trả 503); listing và cart vẫn chạy (chọn A).
